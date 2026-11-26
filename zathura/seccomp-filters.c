@@ -17,6 +17,11 @@
 #include <sys/ioctl.h>   /* for TIOCSTI */
 #include <termios.h>
 
+/* constant missing from musl and older glibc headers */
+#ifndef MFD_NOEXEC_SEAL
+#define MFD_NOEXEC_SEAL 0x0008U
+#endif
+
 #include <gtk/gtk.h>
 #ifdef GDK_WINDOWING_X11
 #include <gdk/x11/gdkx.h>
@@ -116,12 +121,12 @@ int seccomp_enable_strict_filter(zathura_t* zathura) {
 #endif
   /* ALLOW_RULE(lstat); unused? */
   ALLOW_RULE(madvise);
-  ALLOW_RULE(memfd_create);
-  ALLOW_RULE(mmap);
+  /* ALLOW_RULE(memfd_create); specified below */
+  /* ALLOW_RULE(mmap); specified below */
 #ifdef __NR_mmap2
   ALLOW_RULE(mmap2); /* Only required on 32-bit ARM systems */
 #endif
-  ALLOW_RULE(mprotect);
+  /* ALLOW_RULE(mprotect); specified below */
   ALLOW_RULE(mremap); /* mupdf requirement */
   ALLOW_RULE(munmap);
   ALLOW_RULE(newfstatat);
@@ -250,29 +255,35 @@ int seccomp_enable_strict_filter(zathura_t* zathura) {
   ADD_RULE("errno", SCMP_ACT_ERRNO(EPERM), fcntl, 1, SCMP_CMP(1, SCMP_CMP_MASKED_EQ, 0xffffffff, F_SETOWN));
   ADD_RULE("errno", SCMP_ACT_ERRNO(EPERM), fcntl, 1, SCMP_CMP(1, SCMP_CMP_MASKED_EQ, 0xffffffff, F_SETSIG));
   ADD_RULE("errno", SCMP_ACT_ERRNO(EPERM), fcntl, 1, SCMP_CMP(1, SCMP_CMP_MASKED_EQ, 0xffffffff, F_SETOWN_EX));
+  /* no file leases or directory notifications */
+  ADD_RULE("errno", SCMP_ACT_ERRNO(EPERM), fcntl, 1, SCMP_CMP(1, SCMP_CMP_MASKED_EQ, 0xffffffff, F_SETLEASE));
+  ADD_RULE("errno", SCMP_ACT_ERRNO(EPERM), fcntl, 1, SCMP_CMP(1, SCMP_CMP_MASKED_EQ, 0xffffffff, F_NOTIFY));
 
-  /* Special requirements for ioctl, allowed on stdout/stderr */
-  /* deny TIOCSTI and TIOCLINUX to prevent keystroke injection into the controlling TTY */
-  ADD_RULE("errno", SCMP_ACT_ERRNO(EPERM), ioctl, 1,
-           SCMP_CMP(1, SCMP_CMP_MASKED_EQ, 0xffffffff, (scmp_datum_t)TIOCSTI));
-  ADD_RULE("errno", SCMP_ACT_ERRNO(EPERM), ioctl, 1,
-           SCMP_CMP(1, SCMP_CMP_MASKED_EQ, 0xffffffff, (scmp_datum_t)TIOCLINUX));
-  ADD_RULE("allow", SCMP_ACT_ALLOW, ioctl, 1, SCMP_CMP(0, SCMP_CMP_EQ, 1));
-  ADD_RULE("allow", SCMP_ACT_ALLOW, ioctl, 1, SCMP_CMP(0, SCMP_CMP_EQ, 2));
+  /* ioctl: none reaches the kernel, isatty() reports no terminal */
+  ADD_RULE("errno", SCMP_ACT_ERRNO(ENOTTY), ioctl, 0);
+
+  /* madvise: no page merging or forced page reclaim */
+  ADD_RULE("errno", SCMP_ACT_ERRNO(EPERM), madvise, 1, SCMP_CMP(2, SCMP_CMP_MASKED_EQ, 0xffffffff, MADV_MERGEABLE));
+  ADD_RULE("errno", SCMP_ACT_ERRNO(EPERM), madvise, 1, SCMP_CMP(2, SCMP_CMP_MASKED_EQ, 0xffffffff, MADV_PAGEOUT));
+  ADD_RULE("errno", SCMP_ACT_ERRNO(EPERM), madvise, 1, SCMP_CMP(2, SCMP_CMP_MASKED_EQ, 0xffffffff, MADV_COLD));
+
+  /* memfd_create: no executable or hugetlb memfd */
+  ADD_RULE("allow", SCMP_ACT_ALLOW, memfd_create, 1,
+           SCMP_CMP(1, SCMP_CMP_MASKED_EQ, 0xffffffff & ~(MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL), 0));
 
   /* special restrictions for prctl, only allow PR_SET_NAME/PR_SET_PDEATHSIG */
   ADD_RULE("allow", SCMP_ACT_ALLOW, prctl, 1, SCMP_CMP(0, SCMP_CMP_EQ, PR_SET_NAME));
   ADD_RULE("allow", SCMP_ACT_ALLOW, prctl, 1, SCMP_CMP(0, SCMP_CMP_EQ, PR_SET_PDEATHSIG));
 
-  /* This wont work yet, because PROT_EXEC is used after seccomp is called - fix by second filter? */
-  /* Prevent the creation of executable memory */
-  /* ADD_RULE("allow", SCMP_ACT_ALLOW, mmap, 1,  SCMP_CMP(2, SCMP_CMP_MASKED_EQ, PROT_READ | PROT_WRITE |
-              PROT_NONE, PROT_READ | PROT_WRITE | PROT_NONE)); */
+  /* mmap: no memory that is writable and executable at the same time */
+  ADD_RULE("allow", SCMP_ACT_ALLOW, mmap, 1, SCMP_CMP(2, SCMP_CMP_MASKED_EQ, PROT_EXEC, 0));
+  ADD_RULE("allow", SCMP_ACT_ALLOW, mmap, 1, SCMP_CMP(2, SCMP_CMP_MASKED_EQ, PROT_WRITE, 0));
+  ADD_RULE("errno", SCMP_ACT_ERRNO(EPERM), mmap, 1,
+           SCMP_CMP(2, SCMP_CMP_MASKED_EQ, PROT_WRITE | PROT_EXEC, PROT_WRITE | PROT_EXEC));
 
-  /* Prevent the creation of executable memory - required by some files */
-  /*ADD_RULE("allow", SCMP_ACT_ALLOW, mprotect, 1,
-   *         SCMP_CMP(2, SCMP_CMP_MASKED_EQ, PROT_READ | PROT_WRITE | PROT_NONE, PROT_READ | PROT_WRITE | PROT_NONE));
-   */
+  /* mprotect: no memory made executable after it was mapped */
+  ADD_RULE("allow", SCMP_ACT_ALLOW, mprotect, 1, SCMP_CMP(2, SCMP_CMP_MASKED_EQ, PROT_EXEC, 0));
+  ADD_RULE("errno", SCMP_ACT_ERRNO(EPERM), mprotect, 1, SCMP_CMP(2, SCMP_CMP_MASKED_EQ, PROT_EXEC, PROT_EXEC));
 
   /* open syscall still used by musl sometimes */
   /* special restrictions for open, prevent opening files for writing */
